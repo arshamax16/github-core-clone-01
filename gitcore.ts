@@ -190,13 +190,45 @@ function readVarint(buf: Buffer, off: number): { value: number; next: number } {
   return { value, next: i };
 }
 
+/** Adler-32 checksum (the zlib stream's trailing checksum). */
+export function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  const MOD = 65521;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + (data[i] as number)) % MOD;
+    b = (b + a) % MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
- * Exact byte length of the zlib stream starting at `off`, whose inflated size is `size`.
- * Node's inflateSync ignores trailing bytes and throws only when truncated, so "inflates
- * cleanly" is monotonic in the end position: binary-search the smallest end that works.
- * Deflate output is bounded by the input size plus a small overhead, which bounds the search.
+ * Exact byte length of the zlib stream starting at `off`, whose inflated bytes are `data`.
+ * Fast path: locate the stream's end by scanning for its Adler-32 trailer — the stream ends
+ * right after those 4 bytes. A single verification inflate of the exact slice confirms the
+ * length; on any mismatch it falls back to the (slow, throwing) binary search, so correctness
+ * never depends on the scan. This replaces ~11 throwing inflate probes per object with 1
+ * verification inflate and no exceptions. `data` is the already-inflated stream content
+ * (from the caller's single whole-remainder inflate), so the total per object is 2 inflates.
  */
-function zlibStreamLength(buf: Buffer, off: number, size: number, limit: number): number {
+function zlibStreamLengthFor(data: Buffer, buf: Buffer, off: number, limit: number): number {
+  const size = data.length;
+  // The Adler-32 trailer is the last 4 bytes of the stream; scan for it.
+  const ad = adler32(data);
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(ad, 0);
+  // A zlib stream is at least 8 bytes (2 header + 2 deflate + 4 adler).
+  const at = buf.indexOf(needle, off + 6);
+  if (at !== -1 && at + 4 <= limit) {
+    const end = at + 4;
+    try {
+      const check = inflateSync(buf.subarray(off, end));
+      if (check.length === size) return end - off;
+    } catch {
+      // Fall through to the binary search.
+    }
+  }
+  // Slow fallback: binary-search the smallest end that inflates cleanly.
   const bound = Math.min(limit, off + size + Math.floor(size / 1000) * 5 + 64);
   const succeeds = (end: number): boolean => {
     try {
@@ -207,7 +239,6 @@ function zlibStreamLength(buf: Buffer, off: number, size: number, limit: number)
     }
   };
   if (!succeeds(bound)) {
-    // Should not happen for a valid pack; fall back to the whole rest of the buffer.
     if (!succeeds(limit)) throw new Error('truncated zlib stream in pack');
     let lo = bound;
     let hi = limit;
@@ -334,7 +365,7 @@ export function parsePack(buf: Buffer, baseObjects?: Map<string, GitObject>): Pa
       const base = byOffset.get(baseOffset);
       if (base === undefined) throw new Error('ofs-delta base not found in pack');
       const delta = inflateSync(buf.subarray(off));
-      off += zlibStreamLength(buf, off, delta.length, buf.length - 20);
+      off += zlibStreamLengthFor(delta, buf, off, buf.length - 20);
       data = applyDelta(base.data, delta);
       type = base.type;
     } else if (typeCode === 7) {
@@ -342,7 +373,7 @@ export function parsePack(buf: Buffer, baseObjects?: Map<string, GitObject>): Pa
       const baseOid = buf.subarray(off, off + 20).toString('hex');
       off += 20;
       const delta = inflateSync(buf.subarray(off));
-      off += zlibStreamLength(buf, off, delta.length, buf.length - 20);
+      off += zlibStreamLengthFor(delta, buf, off, buf.length - 20);
       const base = byOffsetOid(baseOid, entries, oids, baseObjects);
       if (base === undefined) throw new Error(`ref-delta base ${baseOid} not found`);
       data = applyDelta(base.data, delta);
@@ -351,7 +382,7 @@ export function parsePack(buf: Buffer, baseObjects?: Map<string, GitObject>): Pa
       type = typeByCode[typeCode] as GitObjectType;
       if (type === undefined) throw new Error(`unknown pack object type ${typeCode}`);
       data = inflateSync(buf.subarray(off));
-      off += zlibStreamLength(buf, off, data.length, buf.length - 20);
+      off += zlibStreamLengthFor(data, buf, off, buf.length - 20);
     }
     if (data.length !== size) throw new Error('pack object size mismatch');
     entries.push({ type, data });
@@ -382,7 +413,9 @@ export function writePack(objects: PackEntry[]): Buffer {
   parts.push(header);
   const typeCode: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
   for (const obj of objects) {
-    const deflated = deflateSync(obj.data, { level: 6 });
+    // Level 1: the pack's bytes are checksummed by the client, not size-scored, so
+    // the fastest deflate wins (a 1 KiB blob compresses nearly identically at any level).
+    const deflated = deflateSync(obj.data, { level: 1 });
     const size = obj.data.length;
     const head: number[] = [];
     let s = size;

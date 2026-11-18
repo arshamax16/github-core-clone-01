@@ -74,6 +74,8 @@ export interface Issue {
   createdSeq: number;
   createdAt: string;
   updatedAt: string;
+  /** Cached JSON serialization of this issue (rest.ts); cleared on any mutation. */
+  jsonCache: Buffer | null;
 }
 
 export interface Pull {
@@ -366,6 +368,7 @@ export class Store {
       createdSeq: this.seq,
       createdAt: now,
       updatedAt: now,
+      jsonCache: null,
     };
     this.nextGlobalId += 1;
     this.seq += 1;
@@ -396,6 +399,7 @@ export class Store {
     this.nextGlobalId += 1;
     issue.comments.push(comment);
     issue.updatedAt = new Date().toISOString();
+    issue.jsonCache = null;
     return comment;
   }
 

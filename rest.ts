@@ -16,6 +16,8 @@ export interface RestResult {
   status: number;
   /** null = no body (204). */
   body: unknown;
+  /** Pre-serialized JSON body (e.g. a cached issue); when set, the body is sent as-is. */
+  bodyBuf?: Buffer;
 }
 
 function fail(status: number, message: string): never {
@@ -74,6 +76,15 @@ export function issueJson(issue: Issue): Record<string, unknown> {
     assignee: null,
     milestone: null,
   };
+}
+
+/** The serialized JSON of one issue, cached as a Buffer and invalidated on mutation.
+ *  A Buffer (not a string) so the socket layer writes it without a UTF-8 re-encode. */
+export function issueJsonBuffer(issue: Issue): Buffer {
+  if (issue.jsonCache !== null) return issue.jsonCache;
+  const buf = Buffer.from(JSON.stringify(issueJson(issue)));
+  issue.jsonCache = buf;
+  return buf;
 }
 
 export function pullJson(store: Store, repo: Repo, pull: Pull): Record<string, unknown> {
@@ -511,7 +522,7 @@ function handleIssues(
       const labels = Array.isArray(ctx.body.labels) ? ctx.body.labels.filter((l): l is string => typeof l === 'string') : [];
       const created = store.createIssue(repo, title, bodyText, labels);
       if ('error' in created) fail(422, created.error);
-      return { result: { status: 201, body: issueJson(created) } };
+      return { result: { status: 201, body: null, bodyBuf: issueJsonBuffer(created) } };
     }
     fail(405, 'Method Not Allowed');
   }
@@ -523,9 +534,10 @@ function handleIssues(
   if (issue === undefined) fail(404, 'Not Found');
 
   if (rest.length === 1) {
-    if (method === 'GET') return { result: { status: 200, body: issueJson(issue) } };
+    if (method === 'GET') return { result: { status: 200, body: null, bodyBuf: issueJsonBuffer(issue) } };
     if (method === 'PATCH') {
       if (!isRecord(ctx.body)) fail(400, 'Invalid request body');
+      issue.jsonCache = null;
       if (typeof ctx.body.state === 'string') {
         if (ctx.body.state !== 'open' && ctx.body.state !== 'closed') fail(422, 'Invalid state');
         issue.state = ctx.body.state;
@@ -533,7 +545,7 @@ function handleIssues(
       if (typeof ctx.body.title === 'string') issue.title = ctx.body.title;
       if (typeof ctx.body.body === 'string') issue.body = ctx.body.body;
       issue.updatedAt = new Date().toISOString();
-      return { result: { status: 200, body: issueJson(issue) } };
+      return { result: { status: 200, body: null, bodyBuf: issueJsonBuffer(issue) } };
     }
     fail(405, 'Method Not Allowed');
   }

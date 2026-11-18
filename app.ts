@@ -23,8 +23,10 @@ export interface AppOptions {
 let requestCounter = 0;
 
 function requestId(): string {
+  // A plain counter: the header only needs to be non-empty, and Date.now() +
+  // toString(36) on every reply is pure overhead on the hot paths.
   requestCounter += 1;
-  return `req-${Date.now().toString(36)}-${requestCounter.toString(36)}`;
+  return `req-${requestCounter.toString(36)}`;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
@@ -40,6 +42,20 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   res.end(text);
 }
 
+/** Send a pre-built JSON Buffer (e.g. a cached issue body) without re-stringifying
+ *  and without a UTF-8 re-encode: res.end(Buffer) writes the bytes as-is. */
+function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, extraHeaders: Record<string, string> = {}): void {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': requestId(),
+    'x-oauth-scopes': 'repo, read:org',
+    'content-length': String(buf.length),
+    ...extraHeaders,
+  };
+  res.writeHead(status, headers);
+  res.end(buf);
+}
+
 function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, {
     'content-type': contentType,
@@ -50,15 +66,36 @@ function sendBuffer(res: ServerResponse, status: number, contentType: string, bo
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 32 * 1024 * 1024): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > maxBytes) throw new Error('request body too large');
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks);
+  // Event-based collection: the async-iterator form allocates an async generator
+  // per request, which is pure overhead on the push/write hot paths.
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        if (!done) {
+          done = true;
+          reject(new Error('request body too large'));
+        }
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!done) {
+        done = true;
+        resolve(Buffer.concat(chunks));
+      }
+    });
+    req.on('error', (err) => {
+      if (!done) {
+        done = true;
+        reject(err);
+      }
+    });
+  });
 }
 
 function checkAuth(req: IncomingMessage, expectedToken: string): boolean {
@@ -71,6 +108,11 @@ function checkAuth(req: IncomingMessage, expectedToken: string): boolean {
 }
 
 function decodeSegments(pathname: string): string[] {
+  // Fast path: the suite's paths carry no %-escapes, so skip decodeURIComponent
+  // (a per-segment function call) entirely when there is nothing to decode.
+  if (!pathname.includes('%')) {
+    return pathname.split('/').filter((s) => s !== '');
+  }
   return pathname
     .split('/')
     .filter((s) => s !== '')
@@ -98,14 +140,23 @@ export function createApp(store: Store, options: AppOptions): Server {
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? 'GET';
-    let url: URL;
-    try {
-      url = new URL(req.url ?? '/', 'http://entry');
-    } catch {
+    // Lightweight URL split: `new URL()` parses (and validates) the whole URL on
+    // every request, which is pure overhead on the hot paths. The query string is
+    // parsed lazily, only by the routes that read it.
+    const rawUrl = req.url ?? '/';
+    const qIndex = rawUrl.indexOf('?');
+    const pathname = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
+    if (!pathname.startsWith('/')) {
       sendJson(res, 400, { message: 'Bad Request' });
       return;
     }
-    const pathname = url.pathname;
+    let searchParams: URLSearchParams | null = null;
+    const getParams = (): URLSearchParams => {
+      if (searchParams === null) {
+        searchParams = new URLSearchParams(qIndex === -1 ? '' : rawUrl.slice(qIndex + 1));
+      }
+      return searchParams;
+    };
     const segments = decodeSegments(pathname);
 
     // The boot probe: no auth.
@@ -133,7 +184,7 @@ export function createApp(store: Store, options: AppOptions): Server {
       }
       const tail = segments.slice(2);
       if (method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
-        const service = url.searchParams.get('service');
+        const service = getParams().get('service');
         if (service === 'git-upload-pack') {
           const version2 = (req.headers['git-protocol'] ?? '') === 'version=2';
           const out = version2 ? advertisementV2() : advertisementUploadPack(repo);
@@ -236,14 +287,15 @@ export function createApp(store: Store, options: AppOptions): Server {
           store,
           method,
           segments: segments.slice(2),
-          query: url.searchParams,
+          query: getParams(),
           body: parsed,
           host: req.headers.host ?? '127.0.0.1',
           path: pathname,
         });
         const extra: Record<string, string> = {};
         if (link !== undefined && link !== '') extra.link = link;
-        sendJson(res, result.status, result.body, extra);
+        if (result.bodyBuf !== undefined) sendJsonBuffer(res, result.status, result.bodyBuf, extra);
+        else sendJson(res, result.status, result.body, extra);
       } catch (e) {
         if (e instanceof RestError) {
           sendJson(res, e.status, { message: e.message });

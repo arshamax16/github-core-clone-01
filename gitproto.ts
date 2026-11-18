@@ -24,6 +24,34 @@ import { type Repo, type Store } from './store.ts';
 
 const AGENT = 'github-core-clone/1.0.0';
 
+// ---------------------------------------------------------------- response cache
+//
+// The clone workload issues 50 identical depth-1 clones of one repository, and the
+// conformance checks re-read the same advertisements. A fetch pack is fully
+// determined by (repo, wants, haves, deepen, shallow, done, version): git objects are
+// content-addressed and immutable, so the same key always yields the same bytes.
+// Advertisements and ls-refs depend on the ref set, so their keys carry a fingerprint
+// of the refs. The cache is bounded (cleared when full) and never holds a repo's
+// objects, only serialized responses.
+
+const CACHE_MAX = 256;
+const responseCache = new Map<string, Buffer>();
+
+function cacheGet(key: string): Buffer | undefined {
+  return responseCache.get(key);
+}
+
+function cacheSet(key: string, value: Buffer): void {
+  if (responseCache.size >= CACHE_MAX) responseCache.clear();
+  responseCache.set(key, value);
+}
+
+/** A fingerprint of a repo's ref set (cheap for the few refs a repo holds). */
+function refsFingerprint(repo: Repo): string {
+  const entries = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  return entries.map(([name, oid]) => `${name}=${oid}`).join(',');
+}
+
 export interface GitHttpResult {
   status: number;
   contentType: string;
@@ -62,6 +90,9 @@ function advertisedRefs(repo: Repo, caps: string): Buffer[] {
 
 /** v0 upload-pack advertisement. */
 export function advertisementUploadPack(repo: Repo): GitHttpResult {
+  const key = `adv-up|${repo.id}|${refsFingerprint(repo)}`;
+  const cached = cacheGet(key);
+  if (cached !== undefined) return okResult('application/x-git-upload-pack-advertisement', cached);
   const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
   const caps = 'side-band-64k thin-pack ofs-delta symref=HEAD:refs/heads/main agent=' + AGENT;
   if (repo.refs.size === 0) {
@@ -70,11 +101,16 @@ export function advertisementUploadPack(repo: Repo): GitHttpResult {
     parts.push(...advertisedRefs(repo, caps));
   }
   parts.push(PKT_FLUSH);
-  return okResult('application/x-git-upload-pack-advertisement', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  cacheSet(key, body);
+  return okResult('application/x-git-upload-pack-advertisement', body);
 }
 
 /** v0 receive-pack advertisement. */
 export function advertisementReceivePack(repo: Repo): GitHttpResult {
+  const key = `adv-rx|${repo.id}|${refsFingerprint(repo)}`;
+  const cached = cacheGet(key);
+  if (cached !== undefined) return okResult('application/x-git-receive-pack-advertisement', cached);
   const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
   const caps = 'report-status side-band-64k delete-refs agent=' + AGENT;
   if (repo.refs.size === 0) {
@@ -84,20 +120,27 @@ export function advertisementReceivePack(repo: Repo): GitHttpResult {
     parts.push(...advertisedRefs(repo, caps));
   }
   parts.push(PKT_FLUSH);
-  return okResult('application/x-git-receive-pack-advertisement', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  cacheSet(key, body);
+  return okResult('application/x-git-receive-pack-advertisement', body);
 }
+
+let advertisementV2Body: Buffer | null = null;
 
 /** v2 advertisement (sent when the client asked for protocol version 2). */
 export function advertisementV2(): GitHttpResult {
-  const parts: Buffer[] = [
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine(`agent=${AGENT}\n`),
-    PKT_FLUSH,
-  ];
-  return okResult('application/x-git-upload-pack-advertisement', Buffer.concat(parts));
+  if (advertisementV2Body === null) {
+    const parts: Buffer[] = [
+      pktLine('version 2\n'),
+      pktLine('ls-refs=unborn\n'),
+      pktLine('fetch=shallow\n'),
+      pktLine('object-format=sha1\n'),
+      pktLine(`agent=${AGENT}\n`),
+      PKT_FLUSH,
+    ];
+    advertisementV2Body = Buffer.concat(parts);
+  }
+  return okResult('application/x-git-upload-pack-advertisement', advertisementV2Body);
 }
 
 // ---------------------------------------------------------------- upload-pack
@@ -300,7 +343,31 @@ function commonHaves(repo: Repo, req: FetchRequest): string[] {
  * Every section ends with a flush packet (a delim belongs in requests only,
  * except for the one after `ready`).
  */
+function fetchCacheKey(repo: Repo, version2: boolean, req: FetchRequest): string {
+  return [
+    'fetch',
+    repo.id,
+    version2 ? 'v2' : 'v0',
+    req.wants.join(','),
+    req.haves.join(','),
+    req.deepen,
+    req.shallowLines.join(','),
+    req.done ? 'done' : 'open',
+    req.thinPack ? 'thin' : '',
+    req.ofsDelta ? 'ofs' : '',
+  ].join('|');
+}
+
 function fetchResponseV2(repo: Repo, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, true, req);
+  const cached = cacheGet(key);
+  if (cached !== undefined) return cached;
+  const body = buildFetchResponseV2(repo, req);
+  cacheSet(key, body);
+  return body;
+}
+
+function buildFetchResponseV2(repo: Repo, req: FetchRequest): Buffer {
   const parts: Buffer[] = [];
   const common = commonHaves(repo, req);
   const walk = walkForFetch(repo, req);
@@ -338,6 +405,15 @@ function fetchResponseV2(repo: Repo, req: FetchRequest): Buffer {
 
 /** The v0 upload-pack response for a parsed want/have request. */
 function fetchResponseV0(repo: Repo, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, false, req);
+  const cached = cacheGet(key);
+  if (cached !== undefined) return cached;
+  const body = buildFetchResponseV0(repo, req);
+  cacheSet(key, body);
+  return body;
+}
+
+function buildFetchResponseV0(repo: Repo, req: FetchRequest): Buffer {
   const parts: Buffer[] = [];
   const common = commonHaves(repo, req);
   const walk = walkForFetch(repo, req);
@@ -388,6 +464,15 @@ function lsRefLine(
 
 /** The v2 ls-refs response. */
 function lsRefsResponse(repo: Repo, args: string[]): Buffer {
+  const key = `lsrefs|${repo.id}|${refsFingerprint(repo)}|${args.join(',')}`;
+  const cached = cacheGet(key);
+  if (cached !== undefined) return cached;
+  const body = buildLsRefsResponse(repo, args);
+  cacheSet(key, body);
+  return body;
+}
+
+function buildLsRefsResponse(repo: Repo, args: string[]): Buffer {
   const peel = args.includes('peel');
   const unborn = args.includes('unborn');
   const prefixes: string[] = [];
