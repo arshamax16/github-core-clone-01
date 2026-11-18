@@ -20,6 +20,25 @@ export interface AppOptions {
   expectedToken: string;
 }
 
+/**
+ * Minimal request/response shapes the handlers need. Both transports (node:http
+ * and the raw-socket server in rawhttp.ts) drive the same routing code through
+ * these, so a transport only has to parse the request line/headers/body and
+ * serialise the reply. `body` on the request is the pre-read body (raw
+ * transport); when set, readBody returns it without touching a stream.
+ */
+export interface HttpReq {
+  method?: string;
+  url?: string;
+  headers: Record<string, string | string[] | undefined>;
+  body?: Buffer;
+}
+
+export interface HttpRes {
+  writeHead(status: number, headers: Record<string, string>): void;
+  end(body?: string | Buffer): void;
+}
+
 let requestCounter = 0;
 
 function requestId(): string {
@@ -29,7 +48,7 @@ function requestId(): string {
   return `req-${requestCounter.toString(36)}`;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+function sendJson(res: HttpRes, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   const text = body === null ? '' : JSON.stringify(body);
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
@@ -44,7 +63,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
 
 /** Send a pre-built JSON Buffer (e.g. a cached issue body) without re-stringifying
  *  and without a UTF-8 re-encode: res.end(Buffer) writes the bytes as-is. */
-function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, extraHeaders: Record<string, string> = {}): void {
+function sendJsonBuffer(res: HttpRes, status: number, buf: Buffer, extraHeaders: Record<string, string> = {}): void {
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': requestId(),
@@ -56,7 +75,7 @@ function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, extraH
   res.end(buf);
 }
 
-function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+function sendBuffer(res: HttpRes, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': String(body.length),
@@ -65,14 +84,21 @@ function sendBuffer(res: ServerResponse, status: number, contentType: string, bo
   res.end(body);
 }
 
-async function readBody(req: IncomingMessage, maxBytes = 32 * 1024 * 1024): Promise<Buffer> {
+async function readBody(req: HttpReq, maxBytes = 32 * 1024 * 1024): Promise<Buffer> {
+  // Raw transport: the body was already read while parsing the request.
+  if (req.body !== undefined) {
+    if (req.body.length > maxBytes) throw new Error('request body too large');
+    return req.body;
+  }
+  // node:http path: collect from the stream.
+  const stream = req as unknown as IncomingMessage;
   // Event-based collection: the async-iterator form allocates an async generator
   // per request, which is pure overhead on the push/write hot paths.
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
     let done = false;
-    req.on('data', (chunk: Buffer) => {
+    stream.on('data', (chunk: Buffer) => {
       size += chunk.length;
       if (size > maxBytes) {
         if (!done) {
@@ -83,13 +109,13 @@ async function readBody(req: IncomingMessage, maxBytes = 32 * 1024 * 1024): Prom
       }
       chunks.push(chunk);
     });
-    req.on('end', () => {
+    stream.on('end', () => {
       if (!done) {
         done = true;
         resolve(Buffer.concat(chunks));
       }
     });
-    req.on('error', (err) => {
+    stream.on('error', (err) => {
       if (!done) {
         done = true;
         reject(err);
@@ -98,7 +124,7 @@ async function readBody(req: IncomingMessage, maxBytes = 32 * 1024 * 1024): Prom
   });
 }
 
-function checkAuth(req: IncomingMessage, expectedToken: string): boolean {
+function checkAuth(req: HttpReq, expectedToken: string): boolean {
   const header = req.headers.authorization ?? '';
   if (!header.startsWith('Bearer ')) return false;
   const token = header.slice('Bearer '.length).trim();
@@ -128,7 +154,7 @@ function decodeSegments(pathname: string): string[] {
 export function createApp(store: Store, options: AppOptions): Server {
   const expectedToken = options.expectedToken;
   const server = createServer((req, res) => {
-    void handleRequest(req, res).catch((e: unknown) => {
+    void handleRequest(store, expectedToken, req, res).catch((e: unknown) => {
       try {
         const message = e instanceof Error ? e.message : 'Internal Server Error';
         sendJson(res, 500, { message });
@@ -137,8 +163,16 @@ export function createApp(store: Store, options: AppOptions): Server {
       }
     });
   });
+  return server;
+}
 
-  async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** The routing core: shared by the node:http transport and the raw-socket one. */
+export async function handleRequest(
+  store: Store,
+  expectedToken: string,
+  req: HttpReq,
+  res: HttpRes,
+): Promise<void> {
     const method = req.method ?? 'GET';
     // Lightweight URL split: `new URL()` parses (and validates) the whole URL on
     // every request, which is pure overhead on the hot paths. The query string is
@@ -310,5 +344,3 @@ export function createApp(store: Store, options: AppOptions): Server {
     sendJson(res, 404, { message: 'Not Found' });
   }
 
-  return server;
-}

@@ -548,6 +548,9 @@ function resolveField(ctx: GqlContext, parent: TypedValue, sel: Selection, path:
         }
         found.issue.state = 'closed';
         found.issue.updatedAt = new Date().toISOString();
+        // The REST view caches the issue JSON (issueJsonBuffer); a mutation
+        // here must invalidate it or a later GET returns the stale state.
+        found.issue.jsonCache = null;
         return executeSelections(ctx, { type: 'CloseIssuePayload', value: { repo: found.repo, issue: found.issue } }, sel.selections, path);
       }
       if (sel.name === 'createPullRequest') {
