@@ -1,8 +1,14 @@
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/arshamax16/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/arshamax16/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 # github-core-clone-01
 
 A GitHub-compatible git forge in one Node process with no dependencies: smart HTTP
 clone and push (protocol v0 and v2), repositories/issues/pull requests over REST v3,
 queries and mutations over GraphQL v4, and tools over MCP (2026-07-28 era).
+
+Built for the [Build a GitHub-compatible git forge bounty on make.fun](https://make.fun/bounty/github-core-clone-01).
 
 ## Run it
 
