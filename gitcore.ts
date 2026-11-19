@@ -33,10 +33,11 @@ export function sha1Hex(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
-/** The git object id of `type` + `data` (SHA-1 over "<type> <size>\0" + data). */
+/** The git object id of `type` + `data` (SHA-1 over "<type> <size>\0" + data).
+ *  Streams the header and data into the hash: no Buffer.concat copy of the data. */
 export function hashObject(type: GitObjectType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 /** Parse a commit object's bytes. */

@@ -2,7 +2,7 @@
 // the env at $MAKEFUN_ENV_URL, serve until the env's /done says true, then exit 0.
 // With no MAKEFUN_ENV_URL it serves standalone (for local testing) until SIGTERM.
 
-import { createApp } from './app.ts';
+import { createRawApp } from './rawhttp.ts';
 import { Store } from './store.ts';
 
 function sleep(ms: number): Promise<void> {
@@ -13,7 +13,7 @@ async function main(): Promise<number> {
   const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const store = new Store();
-  const server = createApp(store, { expectedToken: token });
+  const server = createRawApp(store, { expectedToken: token });
 
   const port = await new Promise<number>((resolve, reject) => {
     server.once('error', reject);

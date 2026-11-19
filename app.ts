@@ -41,6 +41,9 @@ export interface HttpRes {
 
 let requestCounter = 0;
 
+/** One shared empty query set for query-less requests (see getParams). */
+const EMPTY_PARAMS = new URLSearchParams('');
+
 function requestId(): string {
   // A plain counter: the header only needs to be non-empty, and Date.now() +
   // toString(36) on every reply is pure overhead on the hot paths.
@@ -187,7 +190,10 @@ export async function handleRequest(
     let searchParams: URLSearchParams | null = null;
     const getParams = (): URLSearchParams => {
       if (searchParams === null) {
-        searchParams = new URLSearchParams(qIndex === -1 ? '' : rawUrl.slice(qIndex + 1));
+        // No query string: share one empty instance instead of building one per
+        // request (the read workload makes 2,000 query-less GETs).
+        searchParams =
+          qIndex === -1 ? EMPTY_PARAMS : new URLSearchParams(rawUrl.slice(qIndex + 1));
       }
       return searchParams;
     };
